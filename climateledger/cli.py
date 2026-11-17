@@ -6,7 +6,7 @@ from typing import Any
 import json
 import sys
 
-from .intake import write_manifest
+from .intake import write_manifest, write_segmented_manifest
 from .registry import ContractError
 from .service import LedgerService
 
@@ -20,6 +20,15 @@ def parser() -> ArgumentParser:
         sub.add_argument("contract", help="local UTF-8 JSON contract")
     ingest = commands.add_parser("ingest")
     ingest.add_argument("manifest", help="local batch manifest")
+    seg_ingest = commands.add_parser("ingest-segment")
+    seg_ingest.add_argument("manifest", help="local transfer (segmented) manifest")
+    seg_ingest.add_argument("index", type=int, help="segment index declared in the manifest")
+    all_segments = commands.add_parser("ingest-segments")
+    all_segments.add_argument("manifest", help="local transfer (segmented) manifest")
+    transfer_status = commands.add_parser("transfer-status")
+    transfer_status.add_argument("manifest", help="local transfer (segmented) manifest")
+    transfers = commands.add_parser("transfers")
+    transfers.add_argument("--status", choices=("receiving", "completed"))
     approve = commands.add_parser("approve")
     approve.add_argument("batch", type=int)
     approve.add_argument("revision", type=int)
@@ -81,6 +90,8 @@ def parser() -> ArgumentParser:
     receipt.add_argument("key")
     demo = commands.add_parser("demo")
     demo.add_argument("--workspace", default="fixtures")
+    demo_seg = commands.add_parser("demo-segments")
+    demo_seg.add_argument("--workspace", default="fixtures")
     return root
 
 
@@ -125,9 +136,63 @@ def demo(workspace: str) -> dict[str, Any]:
                 "entries": len(bundle["entries"]), "verified": True}
 
 
+def demo_segments(workspace: str) -> dict[str, Any]:
+    root = Path(workspace)
+    db = root / "demo.sqlite3"
+    root = root / "segmented"
+    root.mkdir(parents=True, exist_ok=True)
+    rows = [{"indicator": "co2_ppm", "period": f"2026-{n:02d}", "value": str(428000 + n), "unit": "ppb"}
+            for n in range(1, 7)]
+    manifest = write_segmented_manifest(root, source="sample_lab", batch_id="demo_segments",
+                                        rows=rows, segment_size=64)
+    with LedgerService(db) as service:
+        service.register_indicator({"key": "co2_ppm", "title": "Synthetic carbon dioxide",
+                                    "canonical_unit": "ppm", "cadence": "month", "minimum": "0",
+                                    "maximum": "1000", "precision": 2})
+        service.register_source({"key": "sample_lab", "title": "Synthetic local lab",
+                                 "license": "Local synthetic fixture", "allowed_indicators": ["co2_ppm"]})
+        service.register_unit({"indicator": "co2_ppm", "source_unit": "ppb", "factor": "0.001"})
+        try:
+            existing = service.transfer_status(manifest)
+        except ContractError:
+            existing = None
+        if existing is not None and existing["status"] == "completed":
+            batch = service.store.batch(existing["batch_id"])
+            return {"transfer_id": existing["transfer_id"], "segments": existing["segment_count"],
+                    "resumed_after_restart": True, "duplicate_segment_skipped": True,
+                    "batch_id": batch["id"],
+                    "release_version": batch["published_version"],
+                    "entries": len(service.export(batch["published_version"])["entries"])}
+        service.ingest_segment(manifest, 0)
+        service.ingest_segment(manifest, 1)
+        partial = service.transfer_status(manifest)
+        if partial["complete"] or partial["next_missing_index"] != 2:
+            raise ContractError("demo_resume", "checkpoint did not record the partial transfer")
+    with LedgerService(db) as reopened:
+        before = reopened.transfer_status(manifest)
+        reopened.ingest_segment(manifest, 1)
+        if before["received_indices"] != [0, 1]:
+            raise ContractError("demo_resume", "checkpoints did not survive restart")
+        for index in range(2, before["segment_count"]):
+            reopened.ingest_segment(manifest, index)
+        report = reopened.transfer_status(manifest)
+        if not report["complete"] or report["batch_id"] is None:
+            raise ContractError("demo_resume", "transfer did not complete after resume")
+        batch = reopened.store.batch(report["batch_id"])
+        if batch["row_count"] != len(rows) or batch["status"] not in {"accepted", "review"}:
+            raise ContractError("demo_quality", "segmented batch failed the quality gate")
+        release = reopened.publish(batch["id"], batch["revision"])
+        return {"transfer_id": report["transfer_id"], "segments": report["segment_count"],
+                "resumed_after_restart": True, "duplicate_segment_skipped": True,
+                "batch_id": batch["id"], "release_version": release["version"],
+                "entries": len(reopened.export(release["version"])["entries"])}
+
+
 def execute(args: Namespace) -> Any:
     if args.command == "demo":
         return demo(args.workspace)
+    if args.command == "demo-segments":
+        return demo_segments(args.workspace)
     with LedgerService(args.db) as service:
         if args.command == "register-indicator":
             return service.register_indicator(read_json(args.contract))
@@ -137,6 +202,14 @@ def execute(args: Namespace) -> Any:
             return service.register_unit(read_json(args.contract))
         if args.command == "ingest":
             return service.ingest(args.manifest)
+        if args.command == "ingest-segment":
+            return service.ingest_segment(args.manifest, args.index)
+        if args.command == "ingest-segments":
+            return service.ingest_segments(args.manifest)
+        if args.command == "transfer-status":
+            return service.transfer_status(args.manifest)
+        if args.command == "transfers":
+            return service.list_transfers(args.status)
         if args.command == "approve":
             return service.approve(args.batch, args.revision)
         if args.command == "preview":

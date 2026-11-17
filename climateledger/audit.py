@@ -54,6 +54,37 @@ class AuditInspector:
                 "batch_ids": batches, "sources": source_keys, "indicators": indicator_keys,
                 "entry_count": len(bundle["entries"]), "broken_entries": missing}
 
+    def transfer_trace(self) -> list[dict[str, Any]]:
+        traces = []
+        for transfer in self.store.list_transfers():
+            segments = self.store.list_segments(transfer["id"])
+            indices = sorted(row["segment_index"] for row in segments)
+            expected = list(range(transfer["segment_count"]))
+            conflicts = self.store.list_conflicts(transfer["id"])
+            problems = []
+            if len(set(indices)) != len(indices):
+                problems.append("duplicate_segment_checkpoint")
+            if any(row["expected_digest"] != row["actual_digest"] for row in segments):
+                problems.append("segment_digest_mismatch")
+            if transfer["status"] == "completed":
+                if indices != expected:
+                    problems.append("completed_with_missing_segments")
+                if transfer["batch_id"] is None:
+                    problems.append("completed_without_batch")
+                else:
+                    batch = self.store.batch(transfer["batch_id"])
+                    if batch["payload_hash"] != transfer["payload_hash"]:
+                        problems.append("batch_identity_mismatch")
+                    if batch["row_count"] != transfer["row_count"]:
+                        problems.append("batch_row_count_mismatch")
+            traces.append({"transfer_id": transfer["id"], "source": transfer["source"],
+                           "external_id": transfer["external_id"], "status": transfer["status"],
+                           "payload_hash": transfer["payload_hash"], "segment_count": transfer["segment_count"],
+                           "received_count": len(indices), "missing_indices": [i for i in expected if i not in indices],
+                           "conflict_count": len(conflicts), "problems": problems,
+                           "batch_id": transfer["batch_id"]})
+        return traces
+
     def inspect_all(self) -> dict[str, Any]:
         batches = self.store.list_batches()
         latest = self.store.latest_release()
@@ -62,6 +93,10 @@ class AuditInspector:
         if latest:
             releases = [self.release_trace(version) for version in range(1, latest["version"] + 1)]
         violations = [entry for entry in releases if not entry["verified"]]
+        transfer_traces = self.transfer_trace()
+        transfer_violations = [entry for entry in transfer_traces if entry["problems"]]
         return {"batch_count": len(batches), "release_count": len(releases),
                 "violations": violations, "batch_traces": batch_traces,
-                "release_digests": [release["digest"] for release in releases]}
+                "release_digests": [release["digest"] for release in releases],
+                "transfer_count": len(transfer_traces),
+                "transfer_violations": transfer_violations, "transfer_traces": transfer_traces}

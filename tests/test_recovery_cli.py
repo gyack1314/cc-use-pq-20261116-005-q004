@@ -9,7 +9,7 @@ import sqlite3
 import unittest
 
 from climateledger.cli import main
-from climateledger.intake import write_manifest
+from climateledger.intake import write_manifest, write_segmented_manifest
 from climateledger.registry import ContractError
 from climateledger.service import LedgerService
 from support import LedgerCase
@@ -124,3 +124,57 @@ class CliTests(unittest.TestCase):
         repeat = self.call("demo", "--workspace", str(workspace))[1]
         self.assertTrue(repeat["idempotent"])
         self.assertEqual(repeat["release_version"], 1)
+
+    def test_cli_segmented_resume_then_publish(self):
+        indicator = self.contract("indicator.json", {"key": "co2_ppm", "title": "Synthetic carbon dioxide",
+            "canonical_unit": "ppm", "cadence": "month", "precision": 2})
+        source = self.contract("source.json", {"key": "lab_a", "title": "Synthetic lab A",
+            "license": "Local synthetic fixture", "allowed_indicators": ["co2_ppm"]})
+        self.assertEqual(self.call("register-indicator", indicator)[0], 0)
+        self.assertEqual(self.call("register-source", source)[0], 0)
+        rows = [{"indicator": "co2_ppm", "period": f"2026-{n:02d}", "value": "428", "unit": "ppm"}
+                for n in range(1, 5)]
+        manifest = write_segmented_manifest(self.root / "delivery", source="lab_a",
+                                            batch_id="cli_seg", rows=rows, segment_size=40)
+        code, first, _ = self.call("ingest-segment", str(manifest), "0")
+        self.assertEqual(code, 0)
+        self.assertFalse(first["idempotent"])
+        code, status, _ = self.call("transfer-status", str(manifest))
+        self.assertEqual(code, 0)
+        self.assertFalse(status["complete"])
+        self.assertEqual(status["next_missing_index"], 1)
+        code, duplicate, _ = self.call("ingest-segment", str(manifest), "0")
+        self.assertTrue(duplicate["idempotent"])
+        code, finished, _ = self.call("ingest-segments", str(manifest))
+        self.assertEqual(code, 0)
+        self.assertTrue(finished["transfer"]["complete"])
+        batch_id = finished["batch"]["id"]
+        code, published, _ = self.call("publish", str(batch_id), "1")
+        self.assertEqual(code, 0)
+        self.assertEqual(published["manifest"]["batch"]["row_count"], 4)
+
+    def test_cli_corrupt_segment_reports_conflict(self):
+        indicator = self.contract("indicator.json", {"key": "co2_ppm", "title": "Synthetic carbon dioxide",
+            "canonical_unit": "ppm", "cadence": "month", "precision": 2})
+        source = self.contract("source.json", {"key": "lab_a", "title": "Synthetic lab A",
+            "license": "Local synthetic fixture", "allowed_indicators": ["co2_ppm"]})
+        self.call("register-indicator", indicator)
+        self.call("register-source", source)
+        rows = [{"indicator": "co2_ppm", "period": f"2026-{n:02d}", "value": "428", "unit": "ppm"}
+                for n in range(1, 5)]
+        manifest = write_segmented_manifest(self.root / "delivery", source="lab_a",
+                                            batch_id="cli_bad", rows=rows, segment_size=30)
+        descriptor = json.loads(manifest.read_text(encoding="utf-8"))["segments"][1]
+        (manifest.parent / descriptor["payload"]).write_bytes(b"!")
+        code, _, error = self.call("ingest-segment", str(manifest), "1")
+        self.assertEqual(code, 2)
+        self.assertIn("segment_length", error)
+        code, status, _ = self.call("transfer-status", str(manifest))
+        self.assertEqual(status["conflicts"][-1]["code"], "segment_length")
+
+    def test_cli_demo_segments_is_repeatable(self):
+        workspace = self.root / "demo_segments"
+        first = self.call("demo-segments", "--workspace", str(workspace))[1]
+        self.assertTrue(first["resumed_after_restart"])
+        second = self.call("demo-segments", "--workspace", str(workspace))[1]
+        self.assertEqual(second["batch_id"], first["batch_id"])

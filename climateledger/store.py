@@ -41,6 +41,22 @@ CREATE TABLE IF NOT EXISTS release_entries (
     PRIMARY KEY(version, source, indicator, period), FOREIGN KEY(version) REFERENCES releases(version));
 CREATE TABLE IF NOT EXISTS events (
     id INTEGER PRIMARY KEY, at TEXT NOT NULL, kind TEXT NOT NULL, subject TEXT NOT NULL, detail TEXT NOT NULL);
+CREATE TABLE IF NOT EXISTS transfers (
+    id INTEGER PRIMARY KEY, source TEXT NOT NULL, external_id TEXT NOT NULL, payload_hash TEXT NOT NULL,
+    format TEXT NOT NULL, columns TEXT NOT NULL, row_count INTEGER NOT NULL, size INTEGER NOT NULL,
+    segment_count INTEGER NOT NULL, metadata TEXT NOT NULL, status TEXT NOT NULL,
+    batch_id INTEGER, created_at TEXT NOT NULL, updated_at TEXT NOT NULL,
+    UNIQUE(source, external_id, payload_hash),
+    FOREIGN KEY(source) REFERENCES sources(key), FOREIGN KEY(batch_id) REFERENCES batches(id));
+CREATE TABLE IF NOT EXISTS transfer_segments (
+    transfer_id INTEGER NOT NULL, segment_index INTEGER NOT NULL, filename TEXT NOT NULL,
+    offset INTEGER NOT NULL, length INTEGER NOT NULL, expected_digest TEXT NOT NULL,
+    actual_digest TEXT NOT NULL, segment_blob BLOB NOT NULL, received_at TEXT NOT NULL,
+    PRIMARY KEY(transfer_id, segment_index), FOREIGN KEY(transfer_id) REFERENCES transfers(id));
+CREATE TABLE IF NOT EXISTS transfer_conflicts (
+    id INTEGER PRIMARY KEY, transfer_id INTEGER NOT NULL, at TEXT NOT NULL, segment_index INTEGER,
+    stage TEXT NOT NULL, code TEXT NOT NULL, detail TEXT NOT NULL, evidence TEXT NOT NULL,
+    FOREIGN KEY(transfer_id) REFERENCES transfers(id));
 """
 
 
@@ -245,3 +261,98 @@ class LedgerStore:
                                     (version, batch_id))
             self.event("publish", f"batch:{batch_id}", {"version": version, "digest": digest})
             return self.release(version)
+
+    def _transfer(self, row: sqlite3.Row) -> dict[str, Any]:
+        result = dict(row)
+        result["columns"] = json.loads(result["columns"])
+        result["metadata"] = json.loads(result["metadata"])
+        return result
+
+    def get_transfer(self, source: str, external_id: str, payload_hash: str) -> dict[str, Any] | None:
+        row = self.connection.execute(
+            "SELECT * FROM transfers WHERE source=? AND external_id=? AND payload_hash=?",
+            (source, external_id, payload_hash)).fetchone()
+        return self._transfer(row) if row else None
+
+    def upsert_transfer(self, manifest) -> dict[str, Any]:
+        with self.transaction():
+            existing = self.get_transfer(manifest.source, manifest.batch_id, manifest.payload_hash)
+            if existing is not None:
+                self.connection.execute(
+                    "UPDATE transfers SET row_count=?, size=?, segment_count=?, columns=?, metadata=?, updated_at=? "
+                    "WHERE id=?",
+                    (manifest.row_count, manifest.size, len(manifest.segments),
+                     canonical_bytes(manifest.columns).decode(),
+                     canonical_bytes(manifest.metadata).decode(), utc_now(), existing["id"]))
+                return self.get_transfer(manifest.source, manifest.batch_id, manifest.payload_hash)
+            cursor = self.connection.execute(
+                "INSERT INTO transfers(source,external_id,payload_hash,format,columns,row_count,size,segment_count,"
+                "metadata,status,batch_id,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                (manifest.source, manifest.batch_id, manifest.payload_hash, manifest.format,
+                 canonical_bytes(manifest.columns).decode(), manifest.row_count, manifest.size,
+                 len(manifest.segments), canonical_bytes(manifest.metadata).decode(),
+                 "receiving", None, utc_now(), utc_now()))
+            transfer_id = cursor.lastrowid
+            self.event("transfer_register", f"transfer:{transfer_id}",
+                       {"source": manifest.source, "external_id": manifest.batch_id,
+                        "payload_hash": manifest.payload_hash, "segment_count": len(manifest.segments)})
+            return self.get_transfer(manifest.source, manifest.batch_id, manifest.payload_hash)
+
+    def get_segment(self, transfer_id: int, index: int) -> dict[str, Any] | None:
+        row = self.connection.execute(
+            "SELECT * FROM transfer_segments WHERE transfer_id=? AND segment_index=?",
+            (transfer_id, index)).fetchone()
+        return dict(row) if row else None
+
+    def put_segment(self, transfer_id: int, descriptor, actual_digest: str, blob: bytes) -> bool:
+        with self.transaction():
+            if self.get_segment(transfer_id, descriptor.index) is not None:
+                return False
+            self.connection.execute(
+                "INSERT INTO transfer_segments VALUES(?,?,?,?,?,?,?,?,?)",
+                (transfer_id, descriptor.index, descriptor.filename, descriptor.offset, descriptor.length,
+                 descriptor.digest, actual_digest, blob, utc_now()))
+            self.connection.execute("UPDATE transfers SET updated_at=? WHERE id=?", (utc_now(), transfer_id))
+            self.event("segment_received", f"transfer:{transfer_id}",
+                       {"segment_index": descriptor.index, "digest": actual_digest, "length": len(blob)})
+            return True
+
+    def list_segments(self, transfer_id: int) -> list[dict[str, Any]]:
+        return [dict(row) for row in self.connection.execute(
+            "SELECT transfer_id,segment_index,filename,offset,length,expected_digest,actual_digest,received_at "
+            "FROM transfer_segments WHERE transfer_id=? ORDER BY segment_index", (transfer_id,))]
+
+    def segment_blobs(self, transfer_id: int) -> dict[int, bytes]:
+        return {row["segment_index"]: row["segment_blob"] for row in self.connection.execute(
+            "SELECT segment_index, segment_blob FROM transfer_segments WHERE transfer_id=?", (transfer_id,))}
+
+    def add_conflict(self, transfer_id: int, segment_index: int | None, stage: str,
+                     code: str, detail: str, evidence: dict[str, Any]) -> None:
+        with self.transaction():
+            cursor = self.connection.execute(
+                "INSERT INTO transfer_conflicts(transfer_id,at,segment_index,stage,code,detail,evidence) "
+                "VALUES(?,?,?,?,?,?,?)",
+                (transfer_id, utc_now(), segment_index, stage, code, detail,
+                 canonical_bytes(evidence).decode()))
+            self.event("transfer_conflict", f"transfer:{transfer_id}",
+                       {"conflict_id": cursor.lastrowid, "segment_index": segment_index,
+                        "stage": stage, "code": code})
+
+    def list_conflicts(self, transfer_id: int) -> list[dict[str, Any]]:
+        rows = self.connection.execute(
+            "SELECT * FROM transfer_conflicts WHERE transfer_id=? ORDER BY id", (transfer_id,))
+        return [{**dict(row), "evidence": json.loads(row["evidence"])} for row in rows]
+
+    def mark_transfer_completed(self, transfer_id: int, batch_id: int) -> None:
+        with self.transaction():
+            self.connection.execute(
+                "UPDATE transfers SET status='completed', batch_id=?, updated_at=? WHERE id=?",
+                (batch_id, utc_now(), transfer_id))
+            self.event("transfer_completed", f"transfer:{transfer_id}", {"batch_id": batch_id})
+
+    def list_transfers(self, status: str | None = None) -> list[dict[str, Any]]:
+        if status:
+            rows = self.connection.execute("SELECT * FROM transfers WHERE status=? ORDER BY id", (status,))
+        else:
+            rows = self.connection.execute("SELECT * FROM transfers ORDER BY id")
+        return [self._transfer(row) for row in rows]

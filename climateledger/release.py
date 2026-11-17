@@ -17,6 +17,8 @@ class ReleaseBuilder:
             raise ContractError("stale_revision", "expected revision differs")
         if batch["status"] not in {"accepted", "approved", "published"}:
             raise ContractError("quality_gate", "batch has unresolved quality findings")
+        if len(self.store.measurements(batch_id)) > batch["row_count"]:
+            raise ContractError("quality_gate", "stored rows exceed the manifest row count")
         latest = self.store.latest_batch(batch["source"], batch["external_id"])
         if latest["id"] != batch_id and batch["status"] != "published":
             raise ContractError("stale_revision", "newer revision supersedes this batch")

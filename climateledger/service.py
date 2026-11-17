@@ -3,7 +3,7 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Any
 
-from .intake import load_batch
+from .intake import load_batch, load_transfer_manifest
 from .normalize import Normalizer
 from .quality import QualityGate
 from .registry import ContractError, Registry
@@ -14,6 +14,7 @@ from .audit import AuditInspector
 from .coverage import CoverageReporter, BatchCoverage
 from .replay import ReplayInspector
 from .operations import ReviewQueue, ReceiptCatalog
+from .segments import TransferManager
 
 
 class LedgerService:
@@ -31,6 +32,7 @@ class LedgerService:
         self.replay_inspector = ReplayInspector(self.store, self.registry)
         self.queue = ReviewQueue(self.store)
         self.receipts = ReceiptCatalog(self.store, self.registry)
+        self.transfer_manager = TransferManager(self.store, self.registry, self.normalizer, self.quality)
 
     def close(self) -> None:
         self.store.close()
@@ -67,6 +69,19 @@ class LedgerService:
         assessment = self.quality.assess(source.key, measurements, rejected)
         batch = self.store.insert_batch(envelope, assessment, measurements)
         return {"batch": batch, "idempotent": False}
+
+    def ingest_segment(self, transfer_manifest_path: str | Path, index: int) -> dict[str, Any]:
+        return self.transfer_manager.receive_segment(transfer_manifest_path, index)
+
+    def ingest_segments(self, transfer_manifest_path: str | Path) -> dict[str, Any]:
+        return self.transfer_manager.ingest_segments(transfer_manifest_path)
+
+    def transfer_status(self, transfer_manifest_path: str | Path) -> dict[str, Any]:
+        manifest = load_transfer_manifest(transfer_manifest_path)
+        return self.transfer_manager.find_transfer(manifest.source, manifest.batch_id, manifest.payload_hash)
+
+    def list_transfers(self, status: str | None = None) -> list[dict[str, Any]]:
+        return [self.transfer_manager.status_report(item["id"]) for item in self.store.list_transfers(status)]
 
     def approve(self, batch_id: int, expected_revision: int) -> dict[str, Any]:
         return self.store.approve(batch_id, expected_revision)
@@ -146,9 +161,13 @@ class LedgerService:
     def status(self) -> dict[str, Any]:
         latest = self.store.latest_release()
         batches = self.store.list_batches()
+        transfers = self.store.list_transfers()
         return {"indicators": len(self.registry.list_indicators()),
                 "sources": len(self.registry.list_sources()),
                 "batches": len(batches),
                 "by_status": {name: sum(row["status"] == name for row in batches)
                               for name in ("accepted", "review", "rejected", "approved", "published")},
+                "transfers": len(transfers),
+                "transfers_receiving": sum(row["status"] == "receiving" for row in transfers),
+                "transfers_completed": sum(row["status"] == "completed" for row in transfers),
                 "latest_release": latest["version"] if latest else None}
